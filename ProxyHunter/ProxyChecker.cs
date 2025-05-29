@@ -2,25 +2,18 @@
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ProxyHunter
 {
-    /// <summary>
-    /// Checks proxies for responsiveness, latency, and anonymity level.
-    /// </summary>
     public static class ProxyChecker
     {
-        private static readonly HttpClient Client = new();
+        private const int MaxConcurrency = 50;
+        private static readonly SemaphoreSlim Semaphore = new(MaxConcurrency);
 
-        /// <summary>
-        /// Represents proxy check results including anonymity and latency.
-        /// </summary>
         public record ProxyResult(string Proxy, string Anonymity, double LatencyMs);
 
-        /// <summary>
-        /// Contains counts of proxies by anonymity level.
-        /// </summary>
         public class AnonymityStats
         {
             public int Elite { get; set; }
@@ -28,13 +21,8 @@ namespace ProxyHunter
             public int Transparent { get; set; }
         }
 
-        /// <summary>
-        /// Checks all proxies concurrently and returns valid proxies and anonymity statistics.
-        /// </summary>
-        /// <param name="proxies">Dictionary of proxy type to list of proxies.</param>
-        /// <returns>Tuple of valid proxies and anonymity stats.</returns>
-        public static (Dictionary<string, List<ProxyResult>> validProxies, Dictionary<string, AnonymityStats> anonymityStats)
-            CheckProxies(Dictionary<string, List<string>> proxies)
+        public static async Task<(Dictionary<string, List<ProxyResult>> validProxies, Dictionary<string, AnonymityStats> anonymityStats)>
+            CheckProxiesAsync(Dictionary<string, List<string>> proxies)
         {
             var validProxies = new Dictionary<string, List<ProxyResult>>();
             var anonymityStats = new Dictionary<string, AnonymityStats>();
@@ -77,33 +65,35 @@ namespace ProxyHunter
                 }
             }
 
-            Task.WaitAll(tasks.ToArray());
+            await Task.WhenAll(tasks);
 
             return (validProxies, anonymityStats);
         }
 
-        /// <summary>
-        /// Checks a single proxy for latency and anonymity.
-        /// </summary>
-        /// <param name="proxy">Proxy string</param>
-        /// <param name="proxyType">Proxy type</param>
-        /// <returns>ProxyResult or null if not valid</returns>
         private static async Task<ProxyResult?> CheckProxyAsync(string proxy, string proxyType)
         {
-            string testUrl = (proxyType == "http" || proxyType == "https")
-                ? "https://httpbin.org/headers"
-                : "http://httpbin.org/ip";
-
-            var handler = new HttpClientHandler();
-
+            await Semaphore.WaitAsync();
             try
             {
-                WebProxy webProxy = new($"http://{proxy}");
-                handler.Proxy = webProxy;
-                handler.DefaultProxyCredentials = CredentialCache.DefaultCredentials;
+                string testUrl = (proxyType == "http" || proxyType == "https")
+                    ? "https://httpbin.org/headers"
+                    : "http://httpbin.org/ip";
 
-                using var client = new HttpClient(handler);
-                client.Timeout = TimeSpan.FromSeconds(5);
+                // Use correct proxy scheme or just ip:port, assuming HTTP proxy
+                // You can adjust here for socks proxies if you add socks support
+                string proxyAddress = proxy;
+
+                var handler = new HttpClientHandler()
+                {
+                    Proxy = new WebProxy(proxyAddress),
+                    UseProxy = true,
+                    DefaultProxyCredentials = CredentialCache.DefaultCredentials
+                };
+
+                using var client = new HttpClient(handler)
+                {
+                    Timeout = TimeSpan.FromSeconds(8)  // Increased timeout
+                };
                 client.DefaultRequestHeaders.UserAgent.ParseAdd("ProxyHunter/1.0");
 
                 var start = DateTime.UtcNow;
@@ -134,19 +124,19 @@ namespace ProxyHunter
             {
                 return null;
             }
+            finally
+            {
+                Semaphore.Release();
+            }
         }
 
-        /// <summary>
-        /// Calculates average latency from a list of ProxyResults.
-        /// </summary>
         public static double CalculateAverageLatency(List<ProxyResult> proxyResults)
         {
+            if (proxyResults.Count == 0) return 0;
             double total = 0;
-            foreach (var result in proxyResults)
-            {
-                total += result.LatencyMs;
-            }
-            return proxyResults.Count > 0 ? total / proxyResults.Count : 0;
+            foreach (var r in proxyResults)
+                total += r.LatencyMs;
+            return total / proxyResults.Count;
         }
     }
 }

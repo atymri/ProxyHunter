@@ -1,29 +1,25 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ProxyHunter
 {
-    /// <summary>
-    /// Fetches proxy lists asynchronously from multiple URLs.
-    /// </summary>
     public static class ProxyFetcher
     {
-        private static readonly HttpClient Client = new();
+        private static readonly HttpClient Client = new()
+        {
+            Timeout = TimeSpan.FromSeconds(15)
+        };
 
-        /// <summary>
-        /// Fetches all proxies from all sources asynchronously.
-        /// </summary>
-        /// <returns>A dictionary mapping proxy type to a list of proxy strings.</returns>
+        private const int MaxConcurrency = 10;
+
         public static async Task<Dictionary<string, List<string>>> FetchAllProxiesAsync()
         {
-            var proxies = new Dictionary<string, HashSet<string>>();
-
-            foreach (var key in ProxySources.Sources.Keys)
-            {
-                proxies[key] = new HashSet<string>();
-            }
+            var result = new ConcurrentDictionary<string, ConcurrentBag<string>>();
+            using var semaphore = new SemaphoreSlim(MaxConcurrency);
 
             var tasks = new List<Task>();
 
@@ -31,41 +27,56 @@ namespace ProxyHunter
             {
                 foreach (var url in urls)
                 {
-                    tasks.Add(Task.Run(async () =>
-                    {
-                        try
-                        {
-                            var response = await Client.GetStringAsync(url);
-                            foreach (var line in response.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
-                            {
-                                string proxy = line.Trim();
-                                if (ProxyValidator.IsValidProxy(proxy))
-                                {
-                                    lock (proxies)
-                                    {
-                                        proxies[type].Add(proxy);
-                                    }
-                                }
-                            }
-                        }
-                        catch
-                        {
-                            // Ignore failed fetches silently
-                        }
-                    }));
+                    tasks.Add(ProcessUrlAsync(type, url, result, semaphore));
                 }
             }
 
             await Task.WhenAll(tasks);
 
-            // Convert HashSet to List
-            var result = new Dictionary<string, List<string>>();
-            foreach (var (type, set) in proxies)
+            // Convert result to standard Dictionary<string, List<string>>
+            var finalResult = new Dictionary<string, List<string>>();
+            foreach (var (type, proxies) in result)
             {
-                result[type] = new List<string>(set);
+                finalResult[type] = new List<string>(proxies);
             }
 
-            return result;
+            return finalResult;
+        }
+
+        private static async Task ProcessUrlAsync(string type, string url, ConcurrentDictionary<string, ConcurrentBag<string>> result, SemaphoreSlim semaphore)
+        {
+            await semaphore.WaitAsync();
+            try
+            {
+                var response = await Client.GetStringAsync(url);
+                foreach (var line in response.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var proxy = line.Trim();
+                    if (ProxyValidator.IsValidProxy(proxy))
+                    {
+                        result.AddOrUpdate(
+                            type,
+                            _ => new ConcurrentBag<string> { proxy },
+                            (_, bag) => { bag.Add(proxy); return bag; });
+                    }
+                }
+            }
+            catch (TaskCanceledException ex)
+            {
+                Console.WriteLine($"Timeout: {url} - {ex.Message}");
+            }
+            catch (HttpRequestException ex)
+            {
+                Console.WriteLine($"Network error: {url} - {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Unexpected error: {url} - {ex.Message}");
+            }
+            finally
+            {
+                semaphore.Release();
+            }
         }
     }
 }

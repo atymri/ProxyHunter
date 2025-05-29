@@ -25,7 +25,8 @@ namespace ProxyHunter
             }
 
             Console.WriteLine("[*] Checking proxies...");
-            var (validProxies, anonymityStats) = ProxyChecker.CheckProxies(proxies);
+            var (validProxies, anonymityStats) = await ProxyChecker.CheckProxiesAsync(proxies);
+
 
             foreach (var type in validProxies.Keys)
             {
